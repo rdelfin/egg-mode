@@ -5,21 +5,28 @@ use crate::error::Error::{self, *};
 use crate::error::{Result, TwitterErrors};
 
 use hyper::client::ResponseFuture;
-use hyper::{self, Body, Request};
+use hyper::{self, Body, Request, Uri};
+use hyper_proxy::{Intercept, Proxy, ProxyConnector};
 #[cfg(feature = "hyper-rustls")]
 use hyper_rustls::HttpsConnector;
 #[cfg(feature = "native_tls")]
-use hyper_tls::HttpsConnector;
+use hyper_tls::{HttpsConnector, Identity};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json;
 
 use std::convert::TryFrom;
+use std::env;
+use std::fs::File;
+use std::io::Read;
 
 use super::Headers;
 
 const X_RATE_LIMIT_LIMIT: &'static str = "X-Rate-Limit-Limit";
 const X_RATE_LIMIT_REMAINING: &'static str = "X-Rate-Limit-Remaining";
 const X_RATE_LIMIT_RESET: &'static str = "X-Rate-Limit-Reset";
+const IDENTITY_CERT_ENVVAR: &'static str = "EGGMODE_IDENTITY_CERT";
+const IDENTITY_PASS_ENVVAR: &'static str = "EGGMODE_IDENTITY_PASSWORD";
+const PROXY_ENVVAR: &'static str = "EGGMODE_PROXY";
 
 fn rate_limit(headers: &Headers, header: &'static str) -> Result<Option<i32>> {
     let val = headers.get(header);
@@ -42,6 +49,39 @@ fn rate_limit_remaining(headers: &Headers) -> Result<Option<i32>> {
 
 fn rate_limit_reset(headers: &Headers) -> Result<Option<i32>> {
     rate_limit(headers, X_RATE_LIMIT_RESET)
+}
+
+fn empty_str_to_opt(s: String) -> Option<String> {
+    if s == "" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn get_proxy() -> Option<Proxy> {
+    empty_str_to_opt(env::var(PROXY_ENVVAR).unwrap_or("".to_string()))
+        .map(|proxy_str| proxy_str.parse::<Uri>().unwrap())
+        .map(|uri| Proxy::new(Intercept::All, uri.clone()))
+}
+
+#[cfg(feature = "native_tls")]
+fn get_identity() -> Option<Identity> {
+    let identity_path = empty_str_to_opt(env::var(IDENTITY_CERT_ENVVAR).unwrap_or("".to_string()));
+    let identity_password =
+        empty_str_to_opt(env::var(IDENTITY_PASS_ENVVAR).unwrap_or("".to_string()));
+
+    let identity = identity_path.and_then(|path| identity_password.map(|pass| (path, pass)));
+
+    match identity {
+        Some((path, password)) => {
+            let mut file = File::open(path).unwrap();
+            let mut identity = vec![];
+            file.read_to_end(&mut identity).unwrap();
+            Some(Identity::from_pkcs12(&identity, &password).unwrap())
+        }
+        None => None,
+    }
 }
 
 // n.b. this type is re-exported at the crate root - these docs are public!
@@ -91,7 +131,7 @@ impl<T> Response<T> {
     ///contained `T`.
     pub fn try_map<F, U, E>(src: Response<T>, fun: F) -> std::result::Result<Response<U>, E>
     where
-        F: FnOnce(T) -> std::result::Result<U, E>
+        F: FnOnce(T) -> std::result::Result<U, E>,
     {
         Ok(Response {
             rate_limit_status: src.rate_limit_status,
@@ -123,7 +163,7 @@ impl<T: IntoIterator> IntoIterator for Response<T> {
 
     fn into_iter(self) -> Self::IntoIter {
         ResponseIter {
-            it: Response::map(self, |it| it.into_iter())
+            it: Response::map(self, |it| it.into_iter()),
         }
     }
 }
@@ -150,19 +190,37 @@ impl<T: Iterator> Iterator for ResponseIter<T> {
 
 // n.b. this function is re-exported in the `raw` module - these docs are public!
 /// Converts the given request into a raw `ResponseFuture` from hyper.
-pub fn get_response(request: Request<Body>) -> ResponseFuture {
-    let connector = HttpsConnector::new();
-    let client = hyper::Client::builder().build(connector);
-    client.request(request)
+pub fn get_response(mut request: Request<Body>) -> ResponseFuture {
+    let proxy = get_proxy();
+    let identity = get_identity();
+
+    let connector = match identity {
+        Some(identity) => HttpsConnector::new_with_identity(identity),
+        None => HttpsConnector::new(),
+    };
+
+    match proxy {
+        Some(proxy) => {
+            let proxy_uri = proxy.uri().clone();
+            let proxy_connector = ProxyConnector::from_proxy(connector, proxy).unwrap();
+            if let Some(headers) = proxy_connector.http_headers(&proxy_uri) {
+                request.headers_mut().extend(headers.clone().into_iter());
+            }
+            let client = hyper::Client::builder().build(proxy_connector);
+            client.request(request)
+        }
+        None => {
+            let client = hyper::Client::builder().build(connector);
+            client.request(request)
+        }
+    }
 }
 
 // n.b. this function is re-exported in the `raw` module - these docs are public!
 /// Loads the given request, parses the headers and response for potential errors given by Twitter,
 /// and returns the headers and raw bytes returned from the response.
 pub async fn raw_request(request: Request<Body>) -> Result<(Headers, Vec<u8>)> {
-    let connector = HttpsConnector::new();
-    let client = hyper::Client::builder().build(connector);
-    let resp = client.request(request).await?;
+    let resp = get_response(request).await?;
     let (parts, body) = resp.into_parts();
     let body: Vec<_> = hyper::body::to_bytes(body).await?.to_vec();
     if let Ok(errors) = serde_json::from_slice::<TwitterErrors>(&body) {
