@@ -20,7 +20,7 @@ hmac = "0.8"
 hyper = "0.13"
 hyper-rustls = { version = "0.20", optional = true, default-features = false }
 hyper-proxy = "0.7.0"
-hyper-tls = { git = "https://github.com/rdelfin/hyper-tls", branch="feat/identity", optional = true }
+hyper-tls = { git = "https://github.com/rdelfin/hyper-tls", branch="version/me", optional = true }
 lazy_static = "1.4"
 native-tls = { version = "0.2", optional = true }
 mime = "0.3"
