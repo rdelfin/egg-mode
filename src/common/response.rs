@@ -4,15 +4,20 @@
 use crate::error::Error::{self, *};
 use crate::error::{Result, TwitterErrors};
 
-use hyper::client::ResponseFuture;
+use hyper::client::{HttpConnector, ResponseFuture};
 use hyper::{self, Body, Request, Uri};
 use hyper_proxy::{Intercept, Proxy, ProxyConnector};
 #[cfg(feature = "hyper-rustls")]
 use hyper_rustls::HttpsConnector;
 #[cfg(feature = "native_tls")]
-use hyper_tls::{HttpsConnector, Identity};
+use hyper_tls::{
+    native_tls::{Identity, TlsConnector},
+    HttpsConnector,
+};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json;
+#[cfg(feature = "native_tls")]
+use tokio_tls;
 
 use std::convert::TryFrom;
 use std::env;
@@ -63,6 +68,45 @@ fn get_proxy() -> Option<Proxy> {
     empty_str_to_opt(env::var(PROXY_ENVVAR).unwrap_or("".to_string()))
         .map(|proxy_str| proxy_str.parse::<Uri>().unwrap())
         .map(|uri| Proxy::new(Intercept::All, uri.clone()))
+}
+
+// Native TLS supports passing down a proxy and identity
+#[cfg(feature = "native_tls")]
+fn get_response_impl(mut request: Request<Body>) -> ResponseFuture {
+    let proxy = get_proxy();
+    let identity = get_identity();
+
+    let connector = match identity {
+        Some(identity) => HttpsConnector::from((
+            HttpConnector::new(),
+            tokio_tls::TlsConnector::from(
+                TlsConnector::builder().identity(identity).build().unwrap(),
+            ),
+        )),
+        None => HttpsConnector::new(),
+    };
+
+    match proxy {
+        Some(proxy) => {
+            let proxy_uri = proxy.uri().clone();
+            let proxy_connector = ProxyConnector::from_proxy(connector, proxy).unwrap();
+            if let Some(headers) = proxy_connector.http_headers(&proxy_uri) {
+                request.headers_mut().extend(headers.clone().into_iter());
+            }
+            let client = hyper::Client::builder().build(proxy_connector);
+            client.request(request)
+        }
+        None => {
+            let client = hyper::Client::builder().build(connector);
+            client.request(request)
+        }
+    }
+}
+
+#[cfg(not(feature = "native_tls"))]
+fn get_response_impl(mut request: Request<Body>) -> ResponseFuture {
+    let client = hyper::client::builder().build(connector);
+    client.request(request)
 }
 
 #[cfg(feature = "native_tls")]
@@ -190,30 +234,8 @@ impl<T: Iterator> Iterator for ResponseIter<T> {
 
 // n.b. this function is re-exported in the `raw` module - these docs are public!
 /// Converts the given request into a raw `ResponseFuture` from hyper.
-pub fn get_response(mut request: Request<Body>) -> ResponseFuture {
-    let proxy = get_proxy();
-    let identity = get_identity();
-
-    let connector = match identity {
-        Some(identity) => HttpsConnector::new_with_identity(identity),
-        None => HttpsConnector::new(),
-    };
-
-    match proxy {
-        Some(proxy) => {
-            let proxy_uri = proxy.uri().clone();
-            let proxy_connector = ProxyConnector::from_proxy(connector, proxy).unwrap();
-            if let Some(headers) = proxy_connector.http_headers(&proxy_uri) {
-                request.headers_mut().extend(headers.clone().into_iter());
-            }
-            let client = hyper::Client::builder().build(proxy_connector);
-            client.request(request)
-        }
-        None => {
-            let client = hyper::Client::builder().build(connector);
-            client.request(request)
-        }
-    }
+pub fn get_response(request: Request<Body>) -> ResponseFuture {
+    get_response_impl(request)
 }
 
 // n.b. this function is re-exported in the `raw` module - these docs are public!
